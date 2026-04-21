@@ -4,7 +4,8 @@ import sys
 import time
 from datetime import timedelta
 from html import escape
-from urllib.parse import unquote, quote
+import json
+from urllib.parse import parse_qsl
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -139,6 +140,10 @@ def _controller_v1_handler(req: V1RequestBase) -> V1ResponseBase:
         res = _cmd_request_get(req)
     elif req.cmd == 'request.post':
         res = _cmd_request_post(req)
+    elif req.cmd == 'request.dom_submit':
+        res = _cmd_request_dom_submit(req)
+    elif req.cmd == 'request.evaluate':
+        res = _cmd_request_evaluate(req)
     else:
         raise Exception(f"Request parameter 'cmd' = '{req.cmd}' is invalid.")
 
@@ -181,6 +186,77 @@ def _cmd_request_post(req: V1RequestBase) -> V1ResponseBase:
     return res
 
 
+def _cmd_request_dom_submit(req: V1RequestBase) -> V1ResponseBase:
+    if req.postData is None:
+        raise Exception("Request parameter 'postData' is mandatory in 'request.dom_submit' command.")
+
+    if req.session is None:
+        raise Exception("Request parameter 'session' is mandatory in 'request.dom_submit' command.")
+
+    challenge_res = _resolve_challenge(req, 'DOM_SUBMIT')
+    res = V1ResponseBase({})
+    res.status = challenge_res.status
+    res.message = challenge_res.message
+    res.solution = challenge_res.result
+    return res
+
+
+def _cmd_request_evaluate(req: V1RequestBase) -> V1ResponseBase:
+    if req.session is None:
+        raise Exception("Request parameter 'session' is mandatory in 'request.evaluate' command.")
+
+    if not getattr(req, 'javaScript', None):
+        raise Exception("Request parameter 'javaScript' is mandatory in 'request.evaluate' command.")
+
+    ttl = timedelta(minutes=req.session_ttl_minutes) if req.session_ttl_minutes else None
+    session, fresh = SESSIONS_STORAGE.get(
+        req.session,
+        ttl,
+        proxy=req.proxy,
+        user_agent=req.userAgent,
+        user_data_dir=req.userDataDir,
+        browser_args=req.browserArgs,
+        browser_executable_path=req.browserExecutablePath,
+        debugger_address=req.debuggerAddress,
+        keep_attached_browser_alive=True if req.keepAttachedBrowserAlive is None else req.keepAttachedBrowserAlive,
+    )
+    driver = session.driver
+
+    if fresh:
+        logging.debug(f"new session created to perform the evaluate request (session_id={req.session})")
+    else:
+        logging.debug(
+            f"existing session is used to perform the evaluate request "
+            f"(session_id={req.session}, lifetime={str(session.lifetime())}, ttl={str(ttl)})"
+        )
+
+    if req.waitInSeconds and req.waitInSeconds > 0:
+        logging.info("Waiting " + str(req.waitInSeconds) + " seconds before running the evaluate request...")
+        time.sleep(req.waitInSeconds)
+
+    script_args = getattr(req, 'scriptArgs', None) or []
+    result = driver.execute_script(req.javaScript, *script_args)
+
+    if isinstance(result, (dict, list, str, int, float, bool)) or result is None:
+        response_payload = json.dumps(result)
+    else:
+        response_payload = json.dumps(str(result))
+
+    challenge_res = ChallengeResolutionResultT({})
+    challenge_res.url = driver.current_url
+    challenge_res.status = 200
+    challenge_res.cookies = driver.get_cookies()
+    challenge_res.userAgent = utils.get_user_agent(driver)
+    challenge_res.headers = {}
+    challenge_res.response = response_payload
+
+    res = V1ResponseBase({})
+    res.status = STATUS_OK
+    res.message = "Evaluation complete."
+    res.solution = challenge_res
+    return res
+
+
 def _cmd_sessions_create(req: V1RequestBase) -> V1ResponseBase:
     logging.debug("Creating new session...")
 
@@ -191,6 +267,8 @@ def _cmd_sessions_create(req: V1RequestBase) -> V1ResponseBase:
         user_data_dir=req.userDataDir,
         browser_args=req.browserArgs,
         browser_executable_path=req.browserExecutablePath,
+        debugger_address=req.debuggerAddress,
+        keep_attached_browser_alive=True if req.keepAttachedBrowserAlive is None else req.keepAttachedBrowserAlive,
     )
     session_id = session.session_id
 
@@ -246,6 +324,8 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
                 user_data_dir=req.userDataDir,
                 browser_args=req.browserArgs,
                 browser_executable_path=req.browserExecutablePath,
+                debugger_address=req.debuggerAddress,
+                keep_attached_browser_alive=True if req.keepAttachedBrowserAlive is None else req.keepAttachedBrowserAlive,
             )
 
             if fresh:
@@ -262,6 +342,8 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
                 user_data_dir=req.userDataDir,
                 browser_args=req.browserArgs,
                 browser_executable_path=req.browserExecutablePath,
+                debugger_address=req.debuggerAddress,
+                keep_attached_browser_alive=True if req.keepAttachedBrowserAlive is None else req.keepAttachedBrowserAlive,
             )
             logging.debug('New instance of webdriver has been created to perform the request')
         return func_timeout(timeout, _evil_logic, (req, driver, method))
@@ -271,27 +353,68 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
         raise Exception('Error solving the challenge. ' + str(e).replace('\n', '\\n'))
     finally:
         if not req.session and driver is not None:
-            if utils.PLATFORM_VERSION == "nt":
-                driver.close()
-            driver.quit()
+            utils.shutdown_webdriver(driver)
             logging.debug('A used instance of webdriver has been destroyed')
 
 
 def click_verify(driver: WebDriver, num_tabs: int = 1):
+    driver.switch_to.default_content()
+
+    body = None
     try:
-        logging.debug("Try to find the Cloudflare verify checkbox...")
-        actions = ActionChains(driver)
-        actions.pause(5)
-        for _ in range(num_tabs):
-            actions.send_keys(Keys.TAB).pause(0.1)
-        actions.pause(1)
-        actions.send_keys(Keys.SPACE).perform()
-        
-        logging.debug(f"Cloudflare verify checkbox clicked after {num_tabs} tabs!")
+        body = driver.find_element(By.TAG_NAME, 'body')
     except Exception:
-        logging.debug("Cloudflare verify checkbox not found on the page.")
-    finally:
-        driver.switch_to.default_content()
+        logging.debug("Cloudflare page body not found for focus handling.")
+
+    widget_probe = None
+    try:
+        widget_probe = driver.execute_script(
+            """
+            const box = document.querySelector('#GQTnq7');
+            if (!box) {
+                return null;
+            }
+            const rect = box.getBoundingClientRect();
+            return {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                visible: !!(rect.width && rect.height)
+            };
+            """
+        )
+        if widget_probe and widget_probe.get('visible') and body is not None:
+            body_rect = body.rect
+            target_x = widget_probe['x'] + min(35, max(5, widget_probe['width'] * 0.2))
+            target_y = widget_probe['y'] + (widget_probe['height'] * 0.5)
+            offset_x = target_x - (body_rect['width'] / 2)
+            offset_y = target_y - (body_rect['height'] / 2)
+            ActionChains(driver).move_to_element_with_offset(body, offset_x, offset_y).click().perform()
+            logging.debug("Cloudflare widget hotspot click sent to #GQTnq7 before keyboard focus.")
+            time.sleep(1)
+        else:
+            logging.debug("Cloudflare widget fallback target #GQTnq7 not visible.")
+    except Exception:
+        logging.debug("Cloudflare widget fallback click failed.", exc_info=True)
+
+    try:
+        logging.debug("Try keyboard focus lane for Cloudflare verify checkbox...")
+        if body is None:
+            raise RuntimeError('body unavailable')
+        time.sleep(1)
+        for _ in range(num_tabs):
+            body.send_keys(Keys.TAB)
+            time.sleep(0.1)
+        time.sleep(1)
+        body.send_keys(Keys.SPACE)
+        time.sleep(0.5)
+        body.send_keys(Keys.TAB)
+        time.sleep(0.1)
+        body.send_keys(Keys.SPACE)
+        logging.debug(f"Cloudflare keyboard focus lane sent after {num_tabs} initial tabs.")
+    except Exception:
+        logging.debug("Cloudflare keyboard focus lane failed.", exc_info=True)
 
     try:
         logging.debug("Try to find the Cloudflare 'Verify you are human' button...")
@@ -307,6 +430,18 @@ def click_verify(driver: WebDriver, num_tabs: int = 1):
             logging.debug("The Cloudflare 'Verify you are human' button found and clicked!")
     except Exception:
         logging.debug("The Cloudflare 'Verify you are human' button not found on the page.")
+
+    if widget_probe and widget_probe.get('visible') and body is not None:
+        try:
+            body_rect = body.rect
+            target_x = widget_probe['x'] + min(35, max(5, widget_probe['width'] * 0.2))
+            target_y = widget_probe['y'] + (widget_probe['height'] * 0.5)
+            offset_x = target_x - (body_rect['width'] / 2)
+            offset_y = target_y - (body_rect['height'] / 2)
+            ActionChains(driver).move_to_element_with_offset(body, offset_x, offset_y).click().perform()
+            logging.debug("Cloudflare widget hotspot click repeated after keyboard focus.")
+        except Exception:
+            logging.debug("Repeated Cloudflare widget hotspot click failed.", exc_info=True)
 
     time.sleep(2)
 
@@ -384,16 +519,21 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
             logging.debug("Network.setBlockedURLs failed or unsupported on this webdriver")
 
     # navigate to the page
-    logging.debug(f"Navigating to... {req.url}")
     turnstile_token = None
-
-    if method == "POST":
-        _post_request(req, driver)
+    reuse_current_page = bool(getattr(req, 'reuseCurrentPage', False)) and method == "GET"
+    if reuse_current_page:
+        logging.debug(f"Reusing current page for challenge solving. Current URL: {driver.current_url}")
     else:
-        if req.tabs_till_verify is None:
-            driver.get(req.url)
+        logging.debug(f"Navigating to... {req.url}")
+        if method == "POST":
+            _post_request(req, driver)
+        elif method == "DOM_SUBMIT":
+            _dom_submit_request(req, driver)
         else:
-            turnstile_token = _resolve_turnstile_captcha(req, driver)
+            if req.tabs_till_verify is None:
+                driver.get(req.url)
+            else:
+                turnstile_token = _resolve_turnstile_captcha(req, driver)
 
     # set cookies if required
     if req.cookies is not None and len(req.cookies) > 0:
@@ -506,26 +646,16 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
 
 
 def _post_request(req: V1RequestBase, driver: WebDriver):
-    post_form = f'<form id="hackForm" action="{req.url}" method="POST">'
+    post_form = f'<form id="hackForm" action="{escape(req.url, quote=True)}" method="POST">'
     query_string = req.postData if req.postData and req.postData[0] != '?' else req.postData[1:] if req.postData else ''
-    pairs = query_string.split('&')
-    for pair in pairs:
-        parts = pair.split('=', 1)
-        # noinspection PyBroadException
-        try:
-            name = unquote(parts[0])
-        except Exception:
-            name = parts[0]
+    pairs = parse_qsl(query_string, keep_blank_values=True, strict_parsing=False)
+    for name, value in pairs:
         if name == 'submit':
             continue
-        # noinspection PyBroadException
-        try:
-            value = unquote(parts[1]) if len(parts) > 1 else ''
-        except Exception:
-            value = parts[1] if len(parts) > 1 else ''
-        # Protection of " character, for syntax
-        value=value.replace('"','&quot;')
-        post_form += f'<input type="text" name="{escape(quote(name))}" value="{escape(quote(value))}"><br>'
+        post_form += (
+            f'<input type="text" name="{escape(name, quote=True)}" '
+            f'value="{escape(value, quote=True)}"><br>'
+        )
     post_form += '</form>'
     html_content = f"""
         <!DOCTYPE html>
@@ -536,3 +666,74 @@ def _post_request(req: V1RequestBase, driver: WebDriver):
         </body>
         </html>"""
     driver.get("data:text/html;charset=utf-8,{html_content}".format(html_content=html_content))
+
+
+def _dom_submit_request(req: V1RequestBase, driver: WebDriver):
+    query_string = req.postData if req.postData and req.postData[0] != '?' else req.postData[1:] if req.postData else ''
+    pairs = parse_qsl(query_string, keep_blank_values=True, strict_parsing=False)
+    form_selector = getattr(req, 'formSelector', None) or "form"
+    submit_selector = getattr(req, 'submitSelector', None)
+
+    html_element = driver.find_element(By.TAG_NAME, "html")
+
+    driver.execute_script(
+        """
+        const formSelector = arguments[0];
+        const submitSelector = arguments[1];
+        const fields = arguments[2];
+
+        const form = document.querySelector(formSelector);
+        if (!form) {
+            throw new Error(`Form not found for selector: ${formSelector}`);
+        }
+
+        for (const [name, value] of fields) {
+            if (!name) {
+                continue;
+            }
+
+            let field = form.elements.namedItem(name);
+            if (field instanceof RadioNodeList) {
+                field = field.length > 0 ? field[0] : null;
+            }
+
+            if (!field) {
+                field = document.createElement('input');
+                field.type = 'hidden';
+                field.name = name;
+                form.appendChild(field);
+            }
+
+            field.removeAttribute('disabled');
+            field.value = value;
+        }
+
+        const submitButtons = form.querySelectorAll('button[type="submit"], input[type="submit"]');
+        submitButtons.forEach((button) => button.removeAttribute('disabled'));
+
+        if (submitSelector) {
+            const submitElement = form.querySelector(submitSelector) || document.querySelector(submitSelector);
+            if (!submitElement) {
+                throw new Error(`Submit element not found for selector: ${submitSelector}`);
+            }
+            submitElement.removeAttribute('disabled');
+            submitElement.click();
+            return;
+        }
+
+        if (typeof form.requestSubmit === 'function') {
+            form.requestSubmit();
+            return;
+        }
+
+        form.submit();
+        """,
+        form_selector,
+        submit_selector,
+        pairs,
+    )
+
+    try:
+        WebDriverWait(driver, 10).until(staleness_of(html_element))
+    except Exception:
+        logging.debug("Timeout waiting for DOM submit navigation")

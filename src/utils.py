@@ -8,6 +8,8 @@ import sys
 import tempfile
 import urllib.parse
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as SeleniumChromeOptions
 from selenium.webdriver.chrome.webdriver import WebDriver
 import undetected_chromedriver as uc
 
@@ -139,10 +141,52 @@ def _normalize_browser_args(browser_args) -> list[str]:
     raise Exception("browserArgs must be a string or list of strings")
 
 
+def _get_driver_bootstrap_paths() -> tuple[str | None, str | None]:
+    global PATCHED_DRIVER_PATH
+    driver_exe_path = None
+    version_main = None
+    if os.path.exists("/app/chromedriver"):
+        driver_exe_path = "/app/chromedriver"
+    else:
+        version_main = get_chrome_major_version()
+        if PATCHED_DRIVER_PATH is not None:
+            driver_exe_path = PATCHED_DRIVER_PATH
+    return driver_exe_path, version_main
+
+
+def _attach_webdriver(debugger_address: str, browser_executable_path: str = None,
+                      keep_attached_browser_alive: bool = True) -> WebDriver:
+    attach_options = SeleniumChromeOptions()
+    attach_options.binary_location = browser_executable_path or get_chrome_exe_path()
+    attach_options.add_experimental_option('debuggerAddress', debugger_address)
+    driver = webdriver.Chrome(options=attach_options)
+    setattr(driver, '_fs_attached_existing_browser', True)
+    setattr(driver, '_fs_keep_attached_browser_alive', keep_attached_browser_alive)
+    setattr(driver, '_fs_debugger_address', debugger_address)
+    return driver
+
+
 def get_webdriver(proxy: dict = None, user_agent: str = None, user_data_dir: str = None,
-                  browser_args=None, browser_executable_path: str = None) -> WebDriver:
+                  browser_args=None, browser_executable_path: str = None,
+                  debugger_address: str = None,
+                  keep_attached_browser_alive: bool = True) -> WebDriver:
     global PATCHED_DRIVER_PATH, USER_AGENT
     logging.debug('Launching web browser...')
+
+    browser_executable_path = browser_executable_path or get_chrome_exe_path()
+
+    if debugger_address:
+        if proxy is not None:
+            logging.warning('debuggerAddress mode ignores launch-time proxy settings; attach to a browser that is already configured.')
+        if user_agent is not None:
+            logging.warning('debuggerAddress mode ignores launch-time userAgent override; attach to a browser that already has the desired UA.')
+        if user_data_dir is not None:
+            logging.warning('debuggerAddress mode ignores launch-time userDataDir because the target browser is already running.')
+        if browser_args:
+            logging.warning('debuggerAddress mode ignores launch-time browserArgs because the target browser is already running.')
+        return _attach_webdriver(debugger_address=debugger_address,
+                                 browser_executable_path=browser_executable_path,
+                                 keep_attached_browser_alive=keep_attached_browser_alive)
 
     requested_user_agent = user_agent or USER_AGENT
     extra_browser_args = _normalize_browser_args(browser_args)
@@ -187,59 +231,30 @@ def get_webdriver(proxy: dict = None, user_agent: str = None, user_data_dir: str
         logging.debug("Using webdriver proxy: %s", proxy_url)
         options.add_argument('--proxy-server=%s' % proxy_url)
 
-    # note: headless mode is detected (headless = True)
-    # we launch the browser in head-full mode with the window hidden
     windows_headless = False
     if get_config_headless():
         if os.name == 'nt':
             windows_headless = True
         else:
             start_xvfb_display()
-    # For normal headless mode:
-    # options.add_argument('--headless')
 
-    # if we are inside the Docker container, we avoid downloading the driver
-    driver_exe_path = None
-    version_main = None
-    if os.path.exists("/app/chromedriver"):
-        # running inside Docker
-        driver_exe_path = "/app/chromedriver"
-    else:
-        version_main = get_chrome_major_version()
-        if PATCHED_DRIVER_PATH is not None:
-            driver_exe_path = PATCHED_DRIVER_PATH
+    driver_exe_path, version_main = _get_driver_bootstrap_paths()
 
-    # detect chrome path
-    browser_executable_path = browser_executable_path or get_chrome_exe_path()
-
-    # downloads and patches the chromedriver
-    # if we don't set driver_executable_path it downloads, patches, and deletes the driver each time
     try:
         driver = uc.Chrome(options=options, browser_executable_path=browser_executable_path,
                            driver_executable_path=driver_exe_path, version_main=version_main,
                            windows_headless=windows_headless, headless=get_config_headless())
     except Exception as e:
         logging.error("Error starting Chrome: %s" % e)
-        # No point in continuing if we cannot retrieve the driver
         raise e
 
-    # save the patched driver to avoid re-downloads
     if driver_exe_path is None:
         PATCHED_DRIVER_PATH = os.path.join(driver.patcher.data_path, driver.patcher.exe_name)
         if PATCHED_DRIVER_PATH != driver.patcher.executable_path:
             shutil.copy(driver.patcher.executable_path, PATCHED_DRIVER_PATH)
 
-    # clean up proxy extension directory
     if proxy_extension_dir is not None:
         shutil.rmtree(proxy_extension_dir)
-
-    # selenium vanilla
-    # options = webdriver.ChromeOptions()
-    # options.add_argument('--no-sandbox')
-    # options.add_argument('--window-size=1920,1080')
-    # options.add_argument('--disable-setuid-sandbox')
-    # options.add_argument('--disable-dev-shm-usage')
-    # driver = webdriver.Chrome(options=options)
 
     return driver
 
@@ -331,25 +346,50 @@ def extract_version_nt_folder() -> str:
     return ''
 
 
+def shutdown_webdriver(driver: WebDriver):
+    if driver is None:
+        return
+    attached = getattr(driver, '_fs_attached_existing_browser', False)
+    keep_alive = getattr(driver, '_fs_keep_attached_browser_alive', False)
+
+    if attached and keep_alive:
+        service = getattr(driver, 'service', None)
+        if service is not None:
+            try:
+                service.stop()
+            except Exception:
+                logging.debug('Failed to stop attached chromedriver service cleanly.', exc_info=True)
+        return
+
+    if PLATFORM_VERSION == "nt":
+        try:
+            driver.close()
+        except Exception:
+            logging.debug('driver.close() failed during shutdown.', exc_info=True)
+    driver.quit()
+
+
 def get_user_agent(driver=None) -> str:
     global USER_AGENT
-    if USER_AGENT is not None:
+    created_driver = False
+    if driver is None and USER_AGENT is not None:
         return USER_AGENT
 
     try:
         if driver is None:
             driver = get_webdriver()
-        USER_AGENT = driver.execute_script("return navigator.userAgent")
+            created_driver = True
+        user_agent = driver.execute_script("return navigator.userAgent")
         # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
-        USER_AGENT = re.sub('HEADLESS', '', USER_AGENT, flags=re.IGNORECASE)
-        return USER_AGENT
+        user_agent = re.sub('HEADLESS', '', user_agent, flags=re.IGNORECASE)
+        if created_driver or USER_AGENT is None:
+            USER_AGENT = user_agent
+        return user_agent
     except Exception as e:
         raise Exception("Error getting browser User-Agent. " + str(e))
     finally:
-        if driver is not None:
-            if PLATFORM_VERSION == "nt":
-                driver.close()
-            driver.quit()
+        if created_driver and driver is not None:
+            shutdown_webdriver(driver)
 
 
 def start_xvfb_display():

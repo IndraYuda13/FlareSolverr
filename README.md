@@ -164,6 +164,8 @@ This also speeds up the requests since it won't have to launch a new browser ins
 | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | session   | Optional. The session ID that you want to be assigned to the instance. If isn't set a random UUID will be assigned.                                                                                                                                                                                               |
 | proxy     | Optional, default disabled. Eg: `"proxy": {"url": "http://127.0.0.1:8888"}`. You must include the proxy schema in the URL: `http://`, `socks4://` or `socks5://`. Authorization (username/password) is supported. Eg: `"proxy": {"url": "http://127.0.0.1:8888", "username": "testuser", "password": "testpass"}` |
+| debuggerAddress | Experimental local patch. Attach FlareSolverr to an already-running Chrome via remote debugging, for example `"127.0.0.1:9222"`. In this mode FlareSolverr does not launch a fresh browser. |
+| keepAttachedBrowserAlive | Experimental local patch. Default `true` for attach mode. When true, `sessions.destroy` detaches chromedriver from the attached browser but leaves Chrome itself running. |
 
 #### + `sessions.list`
 
@@ -201,13 +203,38 @@ session. When you no longer need to use a session you should make sure to close 
 | returnScreenshot    | Optional, default false. Captures a screenshot of the final rendered page after all challenges and waits are completed. The screenshot is returned as a Base64-encoded PNG string in the `screenshot` field of the response.                                                                                                                 |
 | proxy               | Optional, default disabled. Eg: `"proxy": {"url": "http://127.0.0.1:8888"}`. You must include the proxy schema in the URL: `http://`, `socks4://` or `socks5://`. Authorization (username/password) is not supported. (When the `session` parameter is set, the proxy is ignored; a session specific proxy can be set in `sessions.create`.) |
 | waitInSeconds       | Optional, default none. Length to wait in seconds after solving the challenge, and before returning the results. Useful to allow it to load dynamic content.                                                                                                                                                                                 |
+| reuseCurrentPage    | Experimental local patch. For `GET` requests only. If `true`, FlareSolverr skips `driver.get(url)` and continues solving from the browser's current page. Useful after attaching to a warmed browser that already reached the hard boundary page.                                                                                           |
 | disableMedia        | Optional, default false. When true FlareSolverr will prevent media resources (images, CSS, and fonts) from being loaded to speed up navigation.                                                                                                                                                                                              |
 | tabs_till_verify    | Optional, default none. Number of times the `Tab` button is needed to be pressed to end up on the turnstile captcha, in order to verify it. After verifying the captcha, the result will be stored in the solution under `turnstile_token`.                                                                                                  |
+| debuggerAddress     | Experimental local patch. Attach the request to an already-running Chrome with remote debugging enabled instead of launching a new browser. Useful for warm-browser handoff flows.                                                                                                                               |
+| keepAttachedBrowserAlive | Experimental local patch. Relevant with `debuggerAddress`. Default `true`. Prevents FlareSolverr cleanup from killing the attached external browser.                                                                                                                                                 |
 
 > **Warning**
 > If you want to use Cloudflare clearance cookie in your scripts, make sure you use the FlareSolverr User-Agent too. If they don't match you will see the challenge.
 
 Example response from running the `curl` above:
+
+Example experimental attach flow:
+
+```json
+{
+  "cmd": "sessions.create",
+  "session": "warm-profile-1",
+  "debuggerAddress": "127.0.0.1:9222",
+  "keepAttachedBrowserAlive": true
+}
+```
+
+Then continue with normal requests on that session:
+
+```json
+{
+  "cmd": "request.get",
+  "session": "warm-profile-1",
+  "url": "https://target.example/",
+  "maxTimeout": 60000
+}
+```
 
 ```json
 {

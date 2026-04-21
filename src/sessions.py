@@ -19,6 +19,8 @@ class Session:
     user_data_dir: Optional[str] = None
     browser_args: Optional[list] = None
     browser_executable_path: Optional[str] = None
+    debugger_address: Optional[str] = None
+    keep_attached_browser_alive: bool = True
 
     def lifetime(self) -> timedelta:
         return datetime.now() - self.created_at
@@ -33,6 +35,8 @@ class SessionsStorage:
     def create(self, session_id: Optional[str] = None, proxy: Optional[dict] = None,
                user_agent: Optional[str] = None, user_data_dir: Optional[str] = None,
                browser_args: Optional[list] = None, browser_executable_path: Optional[str] = None,
+               debugger_address: Optional[str] = None,
+               keep_attached_browser_alive: Optional[bool] = True,
                force_new: Optional[bool] = False) -> Tuple[Session, bool]:
         """create creates new instance of WebDriver if necessary,
         assign defined (or newly generated) session_id to the instance
@@ -53,11 +57,15 @@ class SessionsStorage:
             return self.sessions[session_id], False
 
         driver = utils.get_webdriver(proxy=proxy, user_agent=user_agent, user_data_dir=user_data_dir,
-                                     browser_args=browser_args, browser_executable_path=browser_executable_path)
+                                     browser_args=browser_args, browser_executable_path=browser_executable_path,
+                                     debugger_address=debugger_address,
+                                     keep_attached_browser_alive=keep_attached_browser_alive)
         created_at = datetime.now()
         session = Session(session_id, driver, created_at, proxy=proxy, user_agent=user_agent,
                           user_data_dir=user_data_dir, browser_args=browser_args,
-                          browser_executable_path=browser_executable_path)
+                          browser_executable_path=browser_executable_path,
+                          debugger_address=debugger_address,
+                          keep_attached_browser_alive=keep_attached_browser_alive)
 
         self.sessions[session_id] = session
 
@@ -76,15 +84,15 @@ class SessionsStorage:
             return False
 
         session = self.sessions.pop(session_id)
-        if utils.PLATFORM_VERSION == "nt":
-            session.driver.close()
-        session.driver.quit()
+        utils.shutdown_webdriver(session.driver)
         return True
 
     def get(self, session_id: str, ttl: Optional[timedelta] = None,
             proxy: Optional[dict] = None, user_agent: Optional[str] = None,
             user_data_dir: Optional[str] = None, browser_args: Optional[list] = None,
-            browser_executable_path: Optional[str] = None) -> Tuple[Session, bool]:
+            browser_executable_path: Optional[str] = None,
+            debugger_address: Optional[str] = None,
+            keep_attached_browser_alive: Optional[bool] = True) -> Tuple[Session, bool]:
         existing = self.sessions.get(session_id)
         if existing is not None:
             proxy = existing.proxy
@@ -92,16 +100,23 @@ class SessionsStorage:
             user_data_dir = existing.user_data_dir
             browser_args = existing.browser_args
             browser_executable_path = existing.browser_executable_path
+            debugger_address = existing.debugger_address
+            keep_attached_browser_alive = existing.keep_attached_browser_alive
 
         session, fresh = self.create(session_id, proxy=proxy, user_agent=user_agent,
                                      user_data_dir=user_data_dir, browser_args=browser_args,
-                                     browser_executable_path=browser_executable_path)
+                                     browser_executable_path=browser_executable_path,
+                                     debugger_address=debugger_address,
+                                     keep_attached_browser_alive=keep_attached_browser_alive)
 
         if ttl is not None and not fresh and session.lifetime() > ttl:
             logging.debug(f'session\'s lifetime has expired, so the session is recreated (session_id={session_id})')
             session, fresh = self.create(session_id, proxy=proxy, user_agent=user_agent,
                                          user_data_dir=user_data_dir, browser_args=browser_args,
-                                         browser_executable_path=browser_executable_path, force_new=True)
+                                         browser_executable_path=browser_executable_path,
+                                         debugger_address=debugger_address,
+                                         keep_attached_browser_alive=keep_attached_browser_alive,
+                                         force_new=True)
 
         return session, fresh
 

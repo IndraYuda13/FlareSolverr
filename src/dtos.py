@@ -41,6 +41,8 @@ class V1RequestBase(object):
     userDataDir: str = None  # experimental override, Chrome user-data-dir path
     browserArgs: list[str] | str | None = None  # experimental extra Chrome args
     browserExecutablePath: str = None  # experimental Chrome path override
+    debuggerAddress: str = None  # experimental attach-to-existing-browser host:port
+    keepAttachedBrowserAlive: bool = None  # when attaching, stop chromedriver but leave Chrome running by default
 
     # V1Request
     url: str = None
@@ -50,10 +52,13 @@ class V1RequestBase(object):
     download: bool = None   # deprecated v2.0.0, not used
     returnRawHtml: bool = None  # deprecated v2.0.0, not used
     waitInSeconds: int = None
+    reuseCurrentPage: bool = None  # experimental: skip navigation and continue solving from the browser's current page
     # Optional resource blocking flag (blocks images, CSS, and fonts)
     disableMedia: bool = None
     # Optional when you've got a turnstile captcha that needs to be clicked after X number of Tab presses
     tabs_till_verify : int = None
+    javaScript: str = None
+    scriptArgs: list = None
 
     def __init__(self, _dict):
         self.__dict__.update(_dict)
